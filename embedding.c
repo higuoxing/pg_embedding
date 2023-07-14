@@ -75,21 +75,21 @@ _PG_init(void)
 {
 	hnsw_relopt_kind = add_reloption_kind();
 	add_int_reloption(hnsw_relopt_kind, "dims", "Number of dimensions",
-					  0, 0, INT_MAX, AccessExclusiveLock);
+					  0, 0, INT_MAX);
 	add_int_reloption(hnsw_relopt_kind, "maxelements", "Maximal number of elements",
-					  0, 0, INT_MAX, AccessExclusiveLock);
+					  0, 0, INT_MAX);
 	add_int_reloption(hnsw_relopt_kind, "m", "Number of neighbors of each vertex",
-					  100, 0, INT_MAX, AccessExclusiveLock);
+					  100, 0, INT_MAX);
 	add_int_reloption(hnsw_relopt_kind, "efconstruction", "Number of inspected neighbors during index construction",
-					  16, 1, INT_MAX, AccessExclusiveLock);
+					  16, 1, INT_MAX);
 	add_int_reloption(hnsw_relopt_kind, "efsearch", "Number of inspected neighbors during index search",
-					  64, 1, INT_MAX, AccessExclusiveLock);
+					  64, 1, INT_MAX);
 	hnsw_indexes = hnsw_index_create(TopMemoryContext, INDEX_HASH_SIZE, NULL);
 }
 
 
 static void
-hnsw_build_callback(Relation index, ItemPointer tid, Datum *values,
+hnsw_build_callback(Relation index, HeapTuple htup, Datum *values,
 					bool *isnull, bool tupleIsAlive, void *state)
 {
 	HierarchicalNSW* hnsw = (HierarchicalNSW*) state;
@@ -109,7 +109,7 @@ hnsw_build_callback(Relation index, ItemPointer tid, Datum *values,
 			 n_items, hnsw_dimensions(hnsw));
 	}
 
-	memcpy(&label, tid, sizeof(*tid));
+	memcpy(&label, &htup->t_self, sizeof(htup->t_self));
 	hnsw_add_point(hnsw, (coord_t*)ARR_DATA_PTR(array), label);
 }
 
@@ -390,6 +390,9 @@ hnsw_costestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 static bytea *
 hnsw_options(Datum reloptions, bool validate)
 {
+	relopt_value *options;
+	HnswOptions *rdopts;
+	int			numoptions;
 	static const relopt_parse_elt tab[] = {
 		{"dims", RELOPT_TYPE_INT, offsetof(HnswOptions, dims)},
 		{"maxelements", RELOPT_TYPE_INT, offsetof(HnswOptions, maxelements)},
@@ -398,10 +401,22 @@ hnsw_options(Datum reloptions, bool validate)
 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, M)}
 	};
 
-	return (bytea *) build_reloptions(reloptions, validate,
-									  hnsw_relopt_kind,
-									  sizeof(HnswOptions),
-									  tab, lengthof(tab));
+
+	options = parseRelOptions(reloptions, validate, hnsw_relopt_kind,
+							  &numoptions);
+
+	/* if none set, we're done */
+	if (numoptions == 0)
+		return NULL;
+
+	rdopts = allocateReloptStruct(sizeof(HnswOptions), options, numoptions);
+
+	fillRelOptions((void *) rdopts, sizeof(HnswOptions), options, numoptions,
+				   validate, tab, lengthof(tab));
+
+	pfree(options);
+
+	return (bytea *) rdopts;
 }
 
 /*
@@ -432,7 +447,6 @@ hnsw_build(Relation heap, Relation index, IndexInfo *indexInfo)
 static bool
 hnsw_insert(Relation index, Datum *values, bool *isnull, ItemPointer heap_tid,
 			  Relation heap, IndexUniqueCheck checkUnique,
-			  bool indexUnchanged,
 			  IndexInfo *indexInfo)
 {
 	HierarchicalNSW* hnsw = hnsw_get_index(index, heap);
@@ -510,7 +524,6 @@ hnsw_handler(PG_FUNCTION_ARGS)
 
 	amroutine->amstrategies = 0;
 	amroutine->amsupport = 0;
-	amroutine->amoptsprocnum = 0;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = true;
 	amroutine->amcanbackward = false;	/* can change direction mid-scan */
@@ -524,8 +537,6 @@ hnsw_handler(PG_FUNCTION_ARGS)
 	amroutine->ampredlocks = false;
 	amroutine->amcanparallel = false;
 	amroutine->amcaninclude = false;
-	amroutine->amusemaintenanceworkmem = false; /* not used during VACUUM */
-	amroutine->amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL;
 	amroutine->amkeytype = InvalidOid;
 
 	/* Interface functions */
@@ -540,7 +551,6 @@ hnsw_handler(PG_FUNCTION_ARGS)
 	amroutine->amproperty = NULL;	/* TODO AMPROP_DISTANCE_ORDERABLE */
 	amroutine->ambuildphasename = NULL;
 	amroutine->amvalidate = hnsw_validate;
-	amroutine->amadjustmembers = NULL;
 	amroutine->ambeginscan = hnsw_beginscan;
 	amroutine->amrescan = hnsw_rescan;
 	amroutine->amgettuple = hnsw_gettuple;
